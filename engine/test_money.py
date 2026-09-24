@@ -134,6 +134,46 @@ class Forecast(unittest.TestCase):
         self.assertEqual(weeks[-1].balance, 10000 - 150)
 
 
+class Goals(unittest.TestCase):
+    def test_monthly_costs_nets_offsets_and_skips_transfers(self):
+        lg = ledger(recurring=[
+            {"name": "Rent", "amount": 4000, "cadence": "monthly", "day": 1, "source": "t"},
+            {"name": "Roommate", "amount": 2000, "direction": "in", "cadence": "monthly", "day": 1, "source": "t"},
+            {"name": "Insurance", "amount": 1200, "cadence": "annual", "anchor": D(2026, 1, 1), "source": "t"},
+            {"name": "Savings", "amount": 500, "cadence": "monthly", "day": 2, "transfer": True, "source": "t"},
+            {"name": "App", "amount": 30, "cadence": "monthly", "day": 3, "in_forecast": False, "source": "t"}],
+            debts=[{"id": "l", "name": "Loan", "kind": "loan", "balance": 5000, "payment": 300,
+                    "balance_date": D(2026, 9, 1), "source": "t"}])
+        lg["settings"]["everyday_spending"] = 1500
+        c = m.monthly_costs(lg)
+        self.assertAlmostEqual(c["recurring"], 2100)
+        self.assertEqual(c["loans"], 300)
+        self.assertAlmostEqual(c["total"], 3900)
+
+    def test_everyday_spending_averages_personal_cards_only(self):
+        lg = ledger(debts=[{"id": "p", "name": "P", "owner": "personal", "balance": 1},
+                           {"id": "b", "name": "B", "owner": "business", "balance": 1}],
+                    card_spending=[{"card": "p", "period_end": D(2026, 6, 1), "purchases": 900},
+                                   {"card": "p", "period_end": D(2026, 7, 1), "purchases": 300},
+                                   {"card": "p", "period_end": D(2026, 8, 1), "purchases": 600},
+                                   {"card": "p", "period_end": D(2026, 5, 1), "purchases": 9999},  # 4th-latest: ignored
+                                   {"card": "b", "period_end": D(2026, 8, 1), "purchases": 5000}])
+        lg["settings"]["everyday_spending"] = "auto"
+        self.assertAlmostEqual(m.everyday_spending(lg), 600)
+        lg["settings"]["everyday_spending"] = 250
+        self.assertEqual(m.everyday_spending(lg), 250)
+
+    def test_ladder_rolls_the_same_money_from_cards_to_fund(self):
+        lg = ledger(debts=[{"id": "c", "name": "Card", "kind": "card", "balance": 1000, "apr": 0.0,
+                            "balance_date": D(2026, 9, 1), "source": "t"}])
+        lg["settings"].update(everyday_spending=100, emergency_fund_months=6)
+        lad = m.ladder(lg, D(2026, 9, 24), extra=160)
+        self.assertEqual(lad.monthly, 200)            # $40 minimum + $160
+        self.assertEqual(lad.cards_zero, D(2027, 2, 24))  # 5 months
+        self.assertEqual(lad.fund_target, 600)
+        self.assertEqual(lad.fund_full, D(2027, 5, 24))   # 3 more months
+
+
 class Bets(unittest.TestCase):
     def test_scoring(self):
         self.assertAlmostEqual(m.score_bet({"kind": "yes_no", "p": 0.8, "outcome": True}), 0.04)

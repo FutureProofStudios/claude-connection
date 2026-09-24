@@ -24,6 +24,7 @@ money. Don't re-derive it from the inbox.
 | `data/history.yaml` | One snapshot per day of cash, debt, net | yes |
 | `reports/` | Generated reports | yes |
 | `engine/money.py` | All math. Run tests after any change: `python -m unittest discover engine` | no |
+| `data/rules.md` | Rob's rules in plain words; `python engine/money.py plan` fills its `{{numbers}}` and renders `reports/money-rules.pdf`. Keep it in sync with the playbook | yes |
 
 **Privacy gate.** Before any commit that touches `data/` or `reports/`, run
 `sh engine/is_private.sh`. It must print `private`. If it doesn't, don't

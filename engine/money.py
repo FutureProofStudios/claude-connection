@@ -355,6 +355,79 @@ def sweep(ledger: dict, start_cash: float, weeks: list[Week]):
     return amount, low, low_at, floor
 
 
+# ---------------------------------------------------------------- goals
+
+PER_MONTH = {"monthly": 1.0, "weekly": 52 / 12, "biweekly": 26 / 12, "quarterly": 1 / 3, "annual": 1 / 12}
+
+
+def monthly_costs(ledger: dict) -> dict:
+    """What a month of Rob's life and business costs, for sizing the
+    emergency fund. Recurring cash items (net of offsets like the roommate's
+    rent share), loan payments, and average everyday spending on cards and
+    debit (which already includes card-charged subscriptions). Excludes card
+    minimums, payroll, and tax: cards will be gone, payroll is Rob paying
+    himself, and tax money is held separately."""
+    s = settings(ledger)
+    recurring = 0.0
+    for b in ledger.get("recurring") or []:
+        if b.get("in_forecast", True) is False or b.get("transfer") or b.get("active", True) is False:
+            continue
+        sign = 1 if b.get("direction") == "in" else -1
+        recurring -= sign * float(b["amount"]) * PER_MONTH.get(b.get("cadence", "monthly"), 0)
+    loans = sum(float(d.get("payment") or 0) for d in ledger.get("debts") or []
+                if d.get("kind") == "loan" and d.get("balance"))
+    everyday = everyday_spending(ledger)
+    return {"recurring": recurring, "loans": loans, "everyday": everyday,
+            "total": recurring + loans + everyday}
+
+
+def everyday_spending(ledger: dict) -> float:
+    """Average monthly purchases on personal cards (last 3 statements per
+    card), unless settings.everyday_spending is a number. Business cards are
+    left out: their spending mostly follows jobs and stops when work does."""
+    fixed = settings(ledger).get("everyday_spending")
+    if isinstance(fixed, (int, float)) and not isinstance(fixed, bool):
+        return float(fixed)
+    owner = {d["id"]: d.get("owner") for d in ledger.get("debts") or []}
+    by_card: dict[str, list] = {}
+    for r in sorted(ledger.get("card_spending") or [], key=lambda r: to_date(r["period_end"])):
+        if owner.get(r["card"]) == "personal":
+            by_card.setdefault(r["card"], []).append(float(r["purchases"]))
+    return sum(sum(v[-3:]) / len(v[-3:]) for v in by_card.values())
+
+
+@dataclass
+class Ladder:
+    extra: float
+    monthly: float            # total going to goals each month (card minimums + extra)
+    cards_zero: dt.date | None
+    card_interest: float
+    fund_target: float
+    fund_full: dt.date | None
+    retirement_from: dt.date | None
+
+
+def ladder(ledger: dict, today: dt.date, extra: float) -> Ladder:
+    """The goal order: cards to $0, then the emergency fund to its target,
+    then retirement. The same monthly amount (today's card minimums + extra)
+    rolls from one goal to the next as each is finished."""
+    s = settings(ledger)
+    cards = [d for d in ledger.get("debts") or [] if d.get("kind", "card") == "card" and d.get("balance")]
+    monthly = extra
+    for d in cards:
+        i = d["balance"] * apr_on(d, today) / 12
+        monthly += required_payment(d, d["balance"] + i, i)
+    run = simulate(cards, today, extra=extra)
+    target = float(s.get("emergency_fund_months", 6)) * monthly_costs(ledger)["total"]
+    need = max(0.0, target - float(s.get("emergency_fund_start") or 0))
+    if run.months is None or monthly <= 0:
+        return Ladder(extra, monthly, None, run.total_interest, target, None, None)
+    zero = add_months(today, run.months)
+    fund_months = -(-need // monthly)  # ceiling
+    full = add_months(zero, int(fund_months))
+    return Ladder(extra, monthly, zero, run.total_interest, target, full, full)
+
+
 # ---------------------------------------------------------------- bets and scoreboard
 
 def score_bet(b: dict):
@@ -679,6 +752,73 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
     return "\n".join(L)
 
 
+def plan_values(ledger: dict, today: dt.date) -> dict:
+    """Every number the rules PDF quotes, computed here so no number in it is
+    typed by hand. Keys are used as {{key}} in data/rules.md."""
+    s = settings(ledger)
+    debts = [d for d in ledger.get("debts") or [] if d.get("balance")]
+    cards = [d for d in debts if d.get("kind", "card") == "card"]
+    v = {"today": f"{today:%B %-d, %Y}"}
+    v["card_debt"] = money(sum(d["balance"] for d in cards))
+    v["card_interest_mo"] = money(sum(d["balance"] * apr_on(d, today) / 12 for d in cards))
+    v["all_interest_mo"] = money(sum(d["balance"] * apr_on(d, today) / 12 for d in debts))
+    mins = 0.0
+    for d in cards:
+        i = d["balance"] * apr_on(d, today) / 12
+        mins += required_payment(d, d["balance"] + i, i)
+    v["card_minimums"] = money(mins)
+    order = payoff_targets(cards, today)
+    v["payoff_order"] = "; ".join(
+        f"{i + 1}. {d['name']} ({pct(apr_on(d, today))}{', over limit' if is_over_limit(d) else ''}, "
+        f"{money(d['balance'])})" for i, d in enumerate(order))
+    costs = monthly_costs(ledger)
+    v["costs_fixed"] = money(costs["recurring"] + costs["loans"])
+    v["costs_everyday"] = money(costs["everyday"])
+    v["costs_total"] = money(costs["total"])
+    v["fund_months"] = f"{float(s.get('emergency_fund_months', 6)):g}"
+    v["fund_target"] = money(float(s.get("emergency_fund_months", 6)) * costs["total"])
+    v["trim_500_fund"] = money(500 * float(s.get("emergency_fund_months", 6)))
+    v["tax_reserve_balance"] = money(sum(float(r["balance"]) for r in ledger.get("reserves") or []
+                                         if "tax" in r["id"]))
+    v["holdback_pct"] = f"{float(s.get('tax_holdback_pct') or 0):.0%}"
+    v["safety_margin"] = money(s["safety_margin"])
+    floor_rate = float(s.get("director_day_floor") or 0)
+    for extra in (1000, 2500, 5000):
+        lad = ladder(ledger, today, float(extra))
+        k = str(extra)
+        v[f"monthly_{k}"] = money(lad.monthly)
+        v[f"cards_zero_{k}"] = f"{lad.cards_zero:%b %Y}" if lad.cards_zero else "not in view"
+        v[f"fund_full_{k}"] = f"{lad.fund_full:%b %Y}" if lad.fund_full else "not in view"
+        v[f"card_interest_{k}"] = money(lad.card_interest)
+        v[f"days_{k}"] = f"{extra / floor_rate:.1f}" if floor_rate else "?"
+    held = simulate(cards, today)
+    v["cards_zero_0"] = _when(today, held.months)
+    v["card_interest_0"] = money(held.total_interest)
+    start_cash, weeks = forecast(ledger, today)
+    amount, low, low_at, floor = sweep(ledger, start_cash, weeks)
+    v["forecast_low"] = money(low)
+    v["forecast_low_week"] = f"{low_at:%b %-d}" if low_at else "none"
+    v["shortfall"] = money(max(0.0, floor - low))
+    accounts = {a["id"]: a for a in ledger.get("accounts") or []}
+    for o in ledger.get("one_offs") or []:
+        if o.get("status") != "done" and o.get("account") in accounts and "Payroll run 1" in o["name"]:
+            gap = float(o["amount"]) - float(accounts[o["account"]]["balance"])
+            v["payroll1_gap"] = money(max(0.0, gap))
+            v["payroll1_amount"] = money(o["amount"], cents=True)
+    recv = [r for r in ledger.get("receivables") or [] if r.get("status") != "paid"]
+    v["owed_total"] = money(sum(r["amount"] for r in recv))
+    sb = scoreboard(ledger, [], today)
+    v["win_rate"] = f"{sb['win_rate']:.0%} of your last {sb['win_rate_n']} decided quotes" if "win_rate" in sb else "not measured yet"
+    v["days_to_cash"] = f"{sb['days_to_cash']:.0f}" if "days_to_cash" in sb else "?"
+    salary = float(s.get("w2_salary_target") or 0)
+    v["salary"] = money(salary)
+    v["sep_max"] = money(salary * float(s.get("sep_pct_of_salary") or 0))
+    v["ira_limit"] = money(s.get("ira_limit") or 0)
+    v["director_floor"] = money(floor_rate)
+    v["package_rate"] = money(s.get("package_day_rate") or 0)
+    return v
+
+
 def _when(today: dt.date, months: int | None) -> str:
     if months is None:
         return "not within 50 years"
@@ -696,7 +836,7 @@ def load_all():
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["check", "report", "snapshot"])
+    ap.add_argument("command", choices=["check", "report", "snapshot", "plan"])
     ap.add_argument("--today", type=dt.date.fromisoformat, default=dt.date.today())
     ap.add_argument("--write", action="store_true", help="save the report to reports/YYYY-MM-DD.md")
     a = ap.parse_args(argv)
@@ -717,6 +857,17 @@ def main(argv=None) -> int:
         if a.write:
             REPORTS.mkdir(exist_ok=True)
             (REPORTS / f"{a.today}.md").write_text(text + "\n")
+        return 0
+
+    if a.command == "plan":
+        from pdf import fill, render  # needs reportlab; only this command does
+        values = plan_values(ledger, a.today)
+        text = fill((DATA / "rules.md").read_text(), values)
+        REPORTS.mkdir(exist_ok=True)
+        out = REPORTS / "money-rules.pdf"
+        render(text, out, footer=f"Money rules · {a.today:%b %-d, %Y} · private")
+        (REPORTS / "money-rules.md").write_text(text)
+        print(f"wrote {out}")
         return 0
 
     if a.command == "snapshot":

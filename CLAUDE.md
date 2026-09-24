@@ -26,9 +26,8 @@ money. Don't re-derive it from the inbox.
 | `engine/money.py` | All math. Run tests after any change: `python -m unittest discover engine` | no |
 
 **Privacy gate.** Before any commit that touches `data/` or `reports/`, run
-`curl -s -o /dev/null -w "%{http_code}" https://github.com/FutureProofStudios/claude-connection`.
-It must print `404`, which means the repo is private. If it prints `200`, don't commit those
-paths. Tell Rob instead. While the repo is public, `.gitignore` also blocks
+`sh engine/is_private.sh`. It must print `private`. If it doesn't, don't
+commit those paths. Tell Rob instead. While the repo is public, `.gitignore` also blocks
 them. Remove those two lines the first time the gate passes.
 
 ## Rules for editing the ledger

@@ -184,7 +184,9 @@ def simulate(debts: list[dict], today: dt.date, extra: float = 0.0,
     minimums plus `extra`, and send everything beyond the minimums to
     payoff_targets() order (freed-up minimums roll forward).
     """
-    debts = [d for d in debts if d.get("balance") is not None]
+    debts = [d for d in debts if d.get("balance") is not None
+             and (d.get("kind", "card") == "card"
+                  or (d.get("kind") == "loan" and (d.get("payment") or d.get("min_payment"))))]
     bal = {d["id"]: float(d["balance"]) for d in debts}
     budget = None
     if not minimums_only:
@@ -263,13 +265,20 @@ def cash_events(ledger: dict, today: dt.date, end: dt.date) -> list[Event]:
             ev.append(Event(when, float(p["amount"]) * prob, f"{p['client']} ({prob:.0%})",
                             "pipeline", committed=False))
 
+    # A recurring item tied to an account starts the day after that account's
+    # balance date: anything on or before it is already in the balance, and
+    # anything between it and today has happened but isn't in the balance yet.
+    balance_dates = {a["id"]: to_date(a.get("balance_date")) for a in ledger.get("accounts") or []}
     for b in ledger.get("recurring") or []:
         if b.get("active", True) is False or b.get("in_forecast", True) is False:
             continue
         sign = 1 if b.get("direction") == "in" else -1
-        for x in occurrences(b, today, end):
-            ev.append(Event(x, sign * float(b["amount"]), b["name"],
-                            "income" if sign > 0 else "bill"))
+        bd = balance_dates.get(b.get("account"))
+        start = bd + dt.timedelta(days=1) if bd else today
+        for x in occurrences(b, start, end):
+            ev.append(Event(max(x, today), sign * float(b["amount"]), b["name"],
+                            "income" if sign > 0 else "bill",
+                            note="since the last balance, likely already happened" if x < today else ""))
 
     for o in ledger.get("one_offs") or []:
         if o.get("status") == "done" or o.get("amount") is None or o.get("date") is None:
@@ -363,7 +372,7 @@ def scoreboard(ledger: dict, bets: list, today: dt.date) -> dict:
     jobs = [j for j in ledger.get("jobs") or [] if j.get("fee") and j.get("days_total")]
     recent = [j for j in jobs if to_date(j.get("last_work_date") or j.get("paid_on") or today)
               >= today - dt.timedelta(days=180)]
-    if recent:
+    if len(recent) >= 3:
         out["effective_day_rate"] = sum(j["fee"] for j in recent) / sum(j["days_total"] for j in recent)
     decided = [p for p in (ledger.get("pipeline") or []) + (ledger.get("closed") or [])
                if p.get("stage") in ("won", "lost") and p.get("decided_on")]
@@ -418,6 +427,13 @@ def check(ledger: dict, bets: list, today: dt.date) -> tuple[list[str], list[str
                 errors.append(f"{label}: {item['cadence']} needs an anchor date")
             if item.get("cadence") == "monthly" and item.get("day") is None:
                 errors.append(f"{label}: monthly needs a day")
+    for section in ("accounts", "debts", "receivables", "one_offs"):
+        for item in ledger.get(section) or []:
+            if item.get("estimated"):
+                warnings.append(f"{item.get('name') or item.get('client') or item.get('id')}: "
+                                f"figure is an estimate, replace with the real number")
+    if not s.get("tax_reserve_confirmed"):
+        warnings.append(f"Tax reserve ({money(s['tax_reserve'])}) not confirmed by the accountant")
     for a in ledger.get("accounts") or []:
         bd = to_date(a.get("balance_date"))
         if bd and (today - bd).days > s["stale_after_days"]:
@@ -473,7 +489,10 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
     L.append(f"# Money report: {today:%a %b %-d, %Y}")
     L.append("")
     L.append(f"**Net position: {money(net)}** (cash {money(cash)}, debt {money(debt)})")
-    prev = [h for h in history if to_date(h["date"]) < today]
+    card_debt = sum(float(d["balance"]) for d in ledger.get("debts") or []
+                    if d.get("kind", "card") == "card" and d.get("balance"))
+    L.append(f"Card debt: **{money(card_debt)}**. This is the expensive part, and the part the sweep attacks.")
+    prev =[h for h in history if to_date(h["date"]) < today]
     if prev:
         p = prev[-1]
         L.append(f"Change since {to_date(p['date']):%b %-d}: {money(net - p['net'])}")
@@ -489,22 +508,23 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
     targets = payoff_targets(debts, today)
     horizon_end = today + dt.timedelta(days=int(s["due_soon_days"]))
 
-    # ---- Do this week
-    todo = []
+    # ---- Do this week: headline, then dated items in date order, then undated
+    head, dated, other = [], [], []
     if amount > 0 and targets:
         t = targets[0]
-        todo.append(f"**Sweep {money(amount)} to {t['name']}** "
+        head.append(f"**Sweep {money(amount)} to {t['name']}** "
                     f"({'over limit' if is_over_limit(t) else pct(apr_on(t, today)) + ' APR'}). "
                     f"Cash still stays above {money(floor)} for the next {s['horizon_weeks']} weeks.")
     elif low_at:
-        todo.append(f"**No sweep.** Cash is forecast to drop to {money(low)} in the week of "
+        head.append(f"**No sweep.** Cash is forecast to drop to {money(low)} in the week of "
                     f"{low_at:%b %-d}. That's {money(floor - low)} under the {money(floor)} floor, "
                     f"so that much more has to be collected or booked by then.")
     for w in weeks:
         for e in w.events:
-            if e.date <= horizon_end and e.amount < 0 and e.committed:
-                todo.append(f"{e.date:%a %b %-d}: pay {e.label}, {money(-e.amount, cents=True)}"
-                            + (f" ({e.note})" if e.note else ""))
+            if e.date <= horizon_end and e.amount < 0 and e.committed \
+                    and not (e.kind == "bill" and -e.amount < 100):
+                dated.append((e.date, f"pay {e.label}, {money(-e.amount, cents=True)}"
+                              + (f" ({e.note})" if e.note else "")))
     for r in ledger.get("receivables") or []:
         if r.get("status") == "paid":
             continue
@@ -513,22 +533,23 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
             late = (today - due).days
             what = f"{r['client']} {r.get('what', '')}".strip()
             if late > 0:
-                todo.append(f"Chase {what}, {money(r['amount'], cents=True)}: {late} days late")
+                other.append(f"Chase {what}, {money(r['amount'], cents=True)}: {late} days late")
             else:
-                todo.append(f"{due:%a %b %-d}: check {what} arrived, {money(r['amount'], cents=True)}")
+                dated.append((due, f"check {what} arrived, {money(r['amount'], cents=True)}"))
     for p in ledger.get("pipeline") or []:
         if p.get("stage") not in OPEN_STAGES or p.get("stage") == "booked":
             continue
         lt = to_date(p.get("last_touch"))
         db = to_date(p.get("decision_by"))
         if db and db <= horizon_end:
-            todo.append(f"{db:%a %b %-d}: decision due, {p['client']}"
-                        + (f" ({money(p['amount'])})" if p.get("amount") else ""))
+            dated.append((db, f"decision due, {p['client']}"
+                          + (f" ({money(p['amount'])})" if p.get("amount") else "")))
         elif lt and workdays_between(lt, today) >= s["quiet_after_workdays"]:
-            todo.append(f"Nudge {p['client']}: quiet {workdays_between(lt, today)} working days")
+            other.append(f"Nudge {p['client']}: quiet {workdays_between(lt, today)} working days")
     for b in bets:
         if b.get("outcome") is None and to_date(b["check_on"]) <= today:
-            todo.append(f"Grade bet {b['id']}: {b['claim']}")
+            other.append(f"Grade bet {b['id']}: {b['claim']}")
+    todo = head + [f"{d:%a %b %-d}: {t}" for d, t in sorted(dated, key=lambda x: x[0])] + other
     L.append("## Do this week")
     L += [f"- {t}" for t in todo] or ["- Nothing due."]
     L.append("")
@@ -569,23 +590,42 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
             f"{i + 1}. {t['name']}" for i, t in enumerate(targets)) + ".")
     L.append("")
 
-    # ---- Payoff paths
-    L.append("## Payoff paths")
-    L.append("| Monthly payment | Debt-free | Total interest |")
+    # ---- Payoff paths (cards; loans run on their own schedules)
+    cards = [d for d in debts if d.get("kind", "card") == "card"]
+    L.append("## Card payoff paths")
+    L.append("| Monthly card payments | Cards at $0 | Total interest |")
     L.append("|---|---|--:|")
-    mo = simulate(debts, today, minimums_only=True)
-    L.append(f"| Minimums only (shrinking) | {_when(today, mo.months)} | {money(mo.total_interest)} |")
+    mo = simulate(cards, today, minimums_only=True)
+    L.append(f"| Minimums only (they shrink) | {_when(today, mo.months)} | {money(mo.total_interest)} |")
     for extra in s["extra_scenarios"]:
-        run = simulate(debts, today, extra=float(extra))
+        run = simulate(cards, today, extra=float(extra))
         label = "Today's minimums, held steady" if not extra else f"Today's minimums + {money(extra)}"
         L.append(f"| {label} | {_when(today, run.months)} | {money(run.total_interest)} |")
+    loans = [d for d in debts if d.get("kind") == "loan"]
+    if loans:
+        L.append("")
+        L.append("Loans on schedule (no extra payments planned): " + "; ".join(
+            f"{d['name']} paid off {_when(today, simulate([d], today, minimums_only=True).months)}"
+            for d in loans if d.get("payment") or d.get("min_payment")) + ".")
     L.append("")
+
+    # ---- Decisions with a deadline
+    decisions = sorted(ledger.get("decisions") or [], key=lambda x: to_date(x.get("by")) or dt.date.max)
+    open_dec = [x for x in decisions if not x.get("done")]
+    if open_dec:
+        L.append("## Decisions with a deadline")
+        for x in open_dec:
+            by = f"by {to_date(x['by']):%b %-d}" if x.get("by") else "no deadline"
+            worth = f", worth {money(x['worth'])}/yr" if x.get("worth") else ""
+            L.append(f"- {x['what']} ({by}{worth})")
+        L.append("")
 
     # ---- Receivables and pipeline
     recv = [r for r in ledger.get("receivables") or [] if r.get("status") != "paid"]
     L.append(f"## Money owed to you: {money(sum(r['amount'] for r in recv))}")
-    for r in sorted(recv, key=lambda r: to_date(r["due"])):
-        L.append(f"- {r['client']}, {r.get('what', '')}: {money(r['amount'], cents=True)}, due {to_date(r['due']):%b %-d}"
+    for r in sorted(recv, key=lambda r: to_date(r.get("due")) or dt.date.max):
+        due = f"due {to_date(r['due']):%b %-d}" if r.get("due") else "no due date"
+        L.append(f"- {r['client']}, {r.get('what', '')}: {money(r['amount'], cents=True)}, {due}"
                  + (f" ({r['status']})" if r.get("status") not in (None, "sent") else ""))
     L.append("")
     pipe = [p for p in ledger.get("pipeline") or [] if p.get("stage") in OPEN_STAGES]
@@ -623,9 +663,10 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
     L.append("")
 
     errors, warnings = check(ledger, bets, today)
-    if errors or warnings:
+    verify = ledger.get("to_verify") or []
+    if errors or warnings or verify:
         L.append("## Data gaps")
-        L += [f"- ERROR: {e}" for e in errors] + [f"- {w}" for w in warnings]
+        L += [f"- ERROR: {e}" for e in errors] + [f"- {w}" for w in warnings] + [f"- {v}" for v in verify]
         L.append("")
     return "\n".join(L)
 

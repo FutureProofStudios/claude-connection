@@ -108,6 +108,18 @@ class Forecast(unittest.TestCase):
         self.assertEqual(weeks[-1].balance, 10000)
         self.assertAlmostEqual(sum(w.pipeline for w in weeks), 3000)
 
+    def test_recurring_starts_after_the_accounts_balance_date(self):
+        # Balance dated today already includes today's bill; a stale balance
+        # still owes the bills since, which land in week one.
+        bill = {"name": "Rent", "amount": 500, "cadence": "monthly", "day": 22, "account": "chk", "source": "t"}
+        lg = ledger(recurring=[dict(bill)])
+        start, weeks = m.forecast(lg, D(2026, 9, 24))
+        self.assertEqual(weeks[-1].balance, 10000)
+        lg["accounts"][0]["balance_date"] = D(2026, 9, 20)
+        start, weeks = m.forecast(lg, D(2026, 9, 24))
+        self.assertEqual(weeks[0].balance, 9500)
+        self.assertIn("already happened", weeks[0].events[0].note)
+
     def test_card_minimums_come_from_debts(self):
         lg = ledger(debts=[{"id": "c", "name": "Card", "balance": 5000, "apr": 0.2, "min_payment": 150,
                             "due_date": D(2026, 10, 1), "balance_date": D(2026, 9, 4), "source": "t"}])

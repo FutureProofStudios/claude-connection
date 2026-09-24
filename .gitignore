@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Private financial data. Remove these two lines only after the privacy gate
+# in CLAUDE.md passes (the repo returns 404 to a logged-out request).
+data/
+reports/

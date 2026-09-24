@@ -252,8 +252,15 @@ def cash_events(ledger: dict, today: dt.date, end: dt.date) -> list[Event]:
         note = f"{late} days late" if late > 0 else ""
         if when < today:
             when = today
+        committed = late <= s["at_risk_after_days"]
         ev.append(Event(when, float(r["amount"]), f"{r['client']}: {r.get('what', '')}".strip(": "),
-                        "receivable", committed=late <= s["at_risk_after_days"], note=note))
+                        "receivable", committed=committed, note=note))
+        # Rob's rule: a fixed share of every client payment goes to the tax
+        # account the day it lands, so it never counts as spendable cash.
+        hold = float(s.get("tax_holdback_pct") or 0)
+        if hold and not r.get("no_holdback"):
+            ev.append(Event(when, -float(r["amount"]) * hold, f"Tax holdback {hold:.0%} of {r['client']}",
+                            "holdback", committed=committed))
 
     probs = s["stage_probability"]
     for p in ledger.get("pipeline") or []:
@@ -286,7 +293,7 @@ def cash_events(ledger: dict, today: dt.date, end: dt.date) -> list[Event]:
         when = to_date(o["date"])
         if when >= end:
             continue
-        note = "overdue" if when < today else ""
+        note = "; ".join(x for x in ("overdue" if when < today else "", o.get("note", "")) if x)
         sign = 1 if o.get("direction") == "in" else -1
         ev.append(Event(max(when, today), sign * float(o["amount"]), o["name"], "one_off",
                         committed=o.get("committed", True), note=note))
@@ -523,7 +530,8 @@ def report(ledger: dict, bets: list, history: list, today: dt.date) -> str:
         for e in w.events:
             if e.date <= horizon_end and e.amount < 0 and e.committed \
                     and not (e.kind == "bill" and -e.amount < 100):
-                dated.append((e.date, f"pay {e.label}, {money(-e.amount, cents=True)}"
+                verb = "move to the tax account:" if e.kind == "holdback" else "pay"
+                dated.append((e.date, f"{verb} {e.label}, {money(-e.amount, cents=True)}"
                               + (f" ({e.note})" if e.note else "")))
     for r in ledger.get("receivables") or []:
         if r.get("status") == "paid":

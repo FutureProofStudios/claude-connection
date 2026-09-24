@@ -52,7 +52,7 @@ them. Remove those two lines the first time the gate passes.
 - **Math only in the engine.** If a number in a report or email didn't come
   out of `money.py`, don't state it. If the engine can't compute something
   you need, add it to the engine with a test.
-- **Brass Taxes is the source of truth** for bookkeeping, payroll, and tax.
+- **The accountant is the source of truth** for bookkeeping, payroll, and tax.
   Flag differences to Rob and never contradict them.
 - **One playbook change per week**, and only with Rob's yes.
 - **Quiet days:** see `quiet_days` in ledger settings. On those days the only
@@ -90,7 +90,7 @@ them. Remove those two lines the first time the gate passes.
    decision, what's owed to him, leads to nudge, graded bets, and the one
    proposal.
 
-### Monthly (after Brass Taxes sends the month's books)
+### Monthly (after the accountant sends the month's books)
 1. Compare the ledger with the books: income, card balances, anything
    missing.
 2. Every miss becomes a fix to the system itself. That could be a better

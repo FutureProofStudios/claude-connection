@@ -101,6 +101,13 @@ class Forecast(unittest.TestCase):
         start, weeks = m.forecast(lg, D(2026, 9, 24))
         self.assertEqual(weeks[-1].balance, 10000)
 
+    def test_tax_holdback_comes_off_every_client_payment(self):
+        lg = ledger(receivables=[{"id": "r", "client": "X", "amount": 4000, "due": D(2026, 10, 1),
+                                  "status": "sent", "source": "t"}])
+        lg["settings"]["tax_holdback_pct"] = 0.25
+        start, weeks = m.forecast(lg, D(2026, 9, 24))
+        self.assertEqual(weeks[-1].balance, 13000)
+
     def test_pipeline_never_counts_as_cash(self):
         lg = ledger(pipeline=[{"id": "p", "client": "Y", "amount": 10000, "stage": "quoted",
                                "expected_cash": D(2026, 10, 5), "source": "t"}])

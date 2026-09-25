@@ -2,7 +2,9 @@
 
 Supports: # title, ## section, ### subsection, paragraphs, - bullets (two
 levels), 1. numbered items, | tables | (first row is the header), > callouts,
-**bold**, *italic*, and a line with only `<<<pagebreak>>>`. `{{key}}` is
+**bold**, *italic*, a line with only `<<<pagebreak>>>`, a `[[figure:name]]`
+line (a drawing passed in `figures`), and a `::: tiles` block of
+`value | label` lines closed by `:::` (a row of big-number tiles). `{{key}}` is
 replaced from the values dict before rendering, so every number comes from
 the engine.
 """
@@ -60,6 +62,8 @@ def _styles():
         "cell": ParagraphStyle("cell", fontSize=8.8, leading=11.4, **base),
         "cellh": ParagraphStyle("cellh", fontName=bold, fontSize=8.8, leading=11.4, textColor=INK),
         "callout": ParagraphStyle("callout", fontSize=9.8, leading=13.8, **base),
+        "tile_v": ParagraphStyle("tile_v", fontName=bold, fontSize=17, leading=20, textColor=INK),
+        "tile_l": ParagraphStyle("tile_l", fontName=body, fontSize=8, leading=10.5, textColor=MUTED),
     }
 
 
@@ -114,7 +118,30 @@ def _callout(lines: list[str], st, width: float) -> Table:
     return t
 
 
-def render(markdown: str, out: Path, footer: str = "") -> None:
+def _tiles(items: list[tuple[str, str]], st, width: float) -> Table:
+    cells = [[Paragraph(_inline(v), st["tile_v"]), Spacer(1, 3), Paragraph(_inline(l), st["tile_l"])]
+             for v, l in items]
+    gap = 8
+    w = (width - gap * (len(items) - 1)) / len(items)
+    row, widths = [], []
+    for i, c in enumerate(cells):
+        if i:
+            row.append("")
+            widths.append(gap)
+        row.append(c)
+        widths.append(w)
+    t = Table([row], colWidths=widths, hAlign="LEFT")
+    style = [("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 9),
+             ("BOTTOMPADDING", (0, 0), (-1, -1), 9), ("LEFTPADDING", (0, 0), (-1, -1), 10),
+             ("RIGHTPADDING", (0, 0), (-1, -1), 8)]
+    for i in range(0, len(row), 2):
+        style.append(("BACKGROUND", (i, 0), (i, 0), SHADE))
+        style.append(("LINEABOVE", (i, 0), (i, 0), 2, ACCENT))
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def render(markdown: str, out: Path, footer: str = "", figures: dict | None = None) -> None:
     st = _styles()
     doc = SimpleDocTemplate(str(out), pagesize=letter, leftMargin=0.8 * inch, rightMargin=0.8 * inch,
                             topMargin=0.75 * inch, bottomMargin=0.75 * inch, title=footer or "Document")
@@ -158,8 +185,40 @@ def render(markdown: str, out: Path, footer: str = "") -> None:
                 if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells):
                     rows.append(cells)
                 i += 1
-            story.append(_table(rows, st, width))
+            table = _table(rows, st, width)
+            if len(rows) <= 12:
+                # Short tables stay whole, with the heading and lead-in above them.
+                lead = []
+                while story and len(lead) < 3 and isinstance(story[-1], Paragraph):
+                    lead.insert(0, story.pop())
+                    if lead[0].style.name in ("h2", "h3"):
+                        break
+                story.append(KeepTogether(lead + [table]))
+            else:
+                story.append(table)
             story.append(Spacer(1, 8))
+        elif line.startswith("[[figure:"):
+            name = line.strip()[len("[[figure:"):-2]
+            # Pull back the lead-in (up to the last heading, max 3 blocks) so a
+            # heading never gets stranded above a figure on the previous page.
+            lead = []
+            while story and len(lead) < 3 and isinstance(story[-1], Paragraph):
+                lead.insert(0, story.pop())
+                if lead[0].style.name in ("h2", "h3"):
+                    break
+            story.append(KeepTogether(lead + [Spacer(1, 4), figures[name], Spacer(1, 10)]))
+            i += 1
+        elif line.strip() == "::: tiles":
+            items = []
+            i += 1
+            while i < len(lines) and lines[i].strip() != ":::":
+                if "|" in lines[i]:
+                    v, l = lines[i].split("|", 1)
+                    items.append((v.strip(), l.strip()))
+                i += 1
+            i += 1
+            story.append(_tiles(items, st, width))
+            story.append(Spacer(1, 12))
         elif line.startswith(">"):
             block = []
             while i < len(lines) and lines[i].startswith(">"):

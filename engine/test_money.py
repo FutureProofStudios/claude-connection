@@ -174,6 +174,24 @@ class Goals(unittest.TestCase):
         self.assertEqual(lad.fund_full, D(2027, 5, 24))   # 3 more months
 
 
+class Wealth(unittest.TestCase):
+    def test_grow_matches_the_annuity_formula(self):
+        r, n, pmt = 0.07, 30, 10000
+        self.assertAlmostEqual(m.grow(0, pmt, n, r), pmt * ((1 + r) ** n - 1) / r, places=6)
+        self.assertAlmostEqual(m.grow(1000, 0, 2, 0.10), 1210)
+
+    def test_wealth_path_starts_investing_when_the_fund_is_full(self):
+        lg = ledger(debts=[{"id": "c", "name": "Card", "kind": "card", "balance": 480, "apr": 0.0,
+                            "balance_date": D(2026, 9, 1), "source": "t"}],
+                    retirement=[{"id": "ira", "balance": 1000}])
+        lg["settings"].update(everyday_spending=0, emergency_fund_months=6, growth_rate=0.0)
+        # $40 floor minimum + $0 extra = $40/mo: cards gone in 12 months, fund target $0,
+        # so investing starts after month 12 at $40/mo.
+        path = m.wealth_path(lg, D(2026, 9, 24), extra=0.0, years=3)
+        self.assertEqual(path, [1000, 1480, 1960])
+        self.assertEqual(m.wealth_path(lg, D(2026, 9, 24), extra=None, years=2), [1000, 1000])
+
+
 class Bets(unittest.TestCase):
     def test_scoring(self):
         self.assertAlmostEqual(m.score_bet({"kind": "yes_no", "p": 0.8, "outcome": True}), 0.04)

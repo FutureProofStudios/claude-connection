@@ -428,6 +428,38 @@ def ladder(ledger: dict, today: dt.date, extra: float) -> Ladder:
     return Ladder(extra, monthly, zero, run.total_interest, target, full, full)
 
 
+def grow(balance: float, annual: float, years: int, rate: float) -> float:
+    """Value after `years`, adding `annual` at the end of each year."""
+    v = balance
+    for _ in range(years):
+        v = v * (1 + rate) + annual
+    return v
+
+
+def wealth_path(ledger: dict, today: dt.date, extra: float | None, years: int = 30) -> list[float]:
+    """Invested money at the end of each year from now. Today's retirement
+    balances grow at settings.growth_rate. With `extra` set, once the ladder
+    finishes the emergency fund, the same monthly amount keeps going to
+    investing every year (IRA and SEP first, the rest to a regular investing
+    account). extra=None means: contribute nothing, just let today's
+    balances grow. Growth is a long-run average, not a promise; with a
+    real (after-inflation) rate, results are roughly in today's dollars."""
+    s = settings(ledger)
+    rate = float(s["growth_rate"]) if s.get("growth_rate") is not None else 0.07
+    v = sum(float(r["balance"]) for r in ledger.get("retirement") or [])
+    lad = ladder(ledger, today, float(extra)) if extra is not None else None
+    out = []
+    for y in range(1, years + 1):
+        year_end = add_months(today, 12 * y)
+        annual = 0.0
+        if lad and lad.fund_full:
+            months_in = (year_end.year - lad.fund_full.year) * 12 + year_end.month - lad.fund_full.month
+            annual = lad.monthly * max(0, min(12, months_in))
+        v = v * (1 + rate) + annual
+        out.append(v)
+    return out
+
+
 # ---------------------------------------------------------------- bets and scoreboard
 
 def score_bet(b: dict):
@@ -816,6 +848,69 @@ def plan_values(ledger: dict, today: dt.date) -> dict:
     v["ira_limit"] = money(s.get("ira_limit") or 0)
     v["director_floor"] = money(floor_rate)
     v["package_rate"] = money(s.get("package_day_rate") or 0)
+    v.update(big_win_values(ledger, today))
+    return v
+
+
+def big_win_values(ledger: dict, today: dt.date) -> dict:
+    """Numbers for the plain-English plan: what the big wins are worth and
+    what the long game can look like."""
+    s = settings(ledger)
+    v = {}
+    all_debts = ledger.get("debts") or []
+    cards = [d for d in all_debts if d.get("kind", "card") == "card" and d.get("balance")]
+    per_month = sum(d["balance"] * apr_on(d, today) / 12 for d in cards)
+    v["interest_per_day"] = money(per_month * 12 / 365)
+    v["interest_per_year"] = money(per_month * 12)
+    if s.get("director_day_floor"):
+        v["interest_days"] = f"{per_month * 12 / float(s['director_day_floor']):.0f}"
+    held = simulate(cards, today).total_interest
+    for extra in (2500, 5000):
+        v[f"interest_saved_{extra}"] = money(held - simulate(cards, today, extra=float(extra)).total_interest)
+    v["fees_dropped"] = money(sum(float(d.get("annual_fee") or 0) for d in all_debts if d.get("drop_fee")))
+    recurring = ledger.get("recurring") or []
+    v["lender_insurance_year"] = money(12 * sum(float(r["amount"]) for r in recurring if r.get("lender_insurance")))
+    pipe = ledger.get("pipeline") or []
+    v["licensing_pending"] = money(sum(float(p.get("amount") or 0) for p in pipe
+                                       if p.get("type") == "licensing" and p.get("stage") in OPEN_STAGES))
+    # Repeat clients: two or more 2026 jobs (done or booked).
+    fees: dict[str, list] = {}
+    for j in ledger.get("jobs") or []:
+        if j.get("fee"):
+            fees.setdefault(j["client"].split(" (")[0], []).append(float(j["fee"]))
+    repeat = sum(sum(x) for x in fees.values() if len(x) >= 2)
+    v["repeat_fees"] = money(repeat)
+    v["repeat_uplift"] = money(repeat * 0.10)
+    # Gear and the loft: income from things Rob owns or rents.
+    arri = next((d for d in all_debts if d["id"] == s.get("gear_loan_id")), None)
+    if arri and s.get("gear_package_rate"):
+        arri_month = float(arri["payment"]) + sum(float(r["amount"]) for r in recurring
+                                                  if r.get("for_debt") == arri["id"])
+        v["arri_month"] = money(arri_month)
+        v["gear_months"] = f"{float(s['gear_package_rate']) / arri_month:.1f}"
+        v["gear_rate"] = money(s["gear_package_rate"])
+    housing = sum((1 if r.get("direction") == "in" else -1) * float(r["amount"]) for r in recurring if r.get("housing"))
+    loft = next((p for p in pipe if p.get("type") == "loft" and p.get("amount")), None)
+    if loft and housing < 0:
+        v["rent_share"] = money(-housing)
+        v["loft_rate"] = money(loft["amount"])
+        v["loft_months"] = f"{float(loft['amount']) / -housing:.1f}"
+    # Income so far this year (Rob's own invoiced figure).
+    if s.get("income_2026_ytd") and s.get("income_2026_ytd_date"):
+        d = to_date(s["income_2026_ytd_date"])
+        months = (d - dt.date(d.year, 1, 1)).days / (365 / 12)
+        v["income_ytd"] = money(s["income_2026_ytd"])
+        v["income_months"] = f"{months:.0f}"
+        v["income_per_month"] = money(float(s["income_2026_ytd"]) / months)
+    # The long game.
+    v["invested_today"] = money(sum(float(r["balance"]) for r in ledger.get("retirement") or []))
+    v["growth_rate"] = f"{float(s.get('growth_rate', 0.07)):.0%}"
+    v["retire_max_year"] = money(float(s.get("ira_limit") or 0)
+                                 + float(s.get("sep_pct_of_salary") or 0) * float(s.get("w2_salary_target") or 0))
+    for key, extra in (("alone", None), ("2500", 2500.0), ("5000", 5000.0)):
+        path = wealth_path(ledger, today, extra, years=30)
+        for y in (10, 20, 30):
+            v[f"wealth_{key}_{y}"] = money(path[y - 1])
     return v
 
 
@@ -839,6 +934,7 @@ def main(argv=None) -> int:
     ap.add_argument("command", choices=["check", "report", "snapshot", "plan"])
     ap.add_argument("--today", type=dt.date.fromisoformat, default=dt.date.today())
     ap.add_argument("--write", action="store_true", help="save the report to reports/YYYY-MM-DD.md")
+    ap.add_argument("--doc", choices=["rules", "richlife", "all"], default="all", help="which plan PDF to build")
     a = ap.parse_args(argv)
     ledger, bets, history = load_all()
 
@@ -860,14 +956,20 @@ def main(argv=None) -> int:
         return 0
 
     if a.command == "plan":
-        from pdf import fill, render  # needs reportlab; only this command does
+        import charts  # needs reportlab; only this command does
+        from pdf import fill, render
         values = plan_values(ledger, a.today)
-        text = fill((DATA / "rules.md").read_text(), values)
         REPORTS.mkdir(exist_ok=True)
-        out = REPORTS / "money-rules.pdf"
-        render(text, out, footer=f"Money rules · {a.today:%b %-d, %Y} · private")
-        (REPORTS / "money-rules.md").write_text(text)
-        print(f"wrote {out}")
+        docs = {"rules": ("rules.md", "money-rules", "Money rules"),
+                "richlife": ("richlife.md", "rich-life-plan", "Your Rich Life Plan")}
+        for key in ([a.doc] if a.doc != "all" else list(docs)):
+            src, name, title = docs[key]
+            text = fill((DATA / src).read_text(), values)
+            out = REPORTS / f"{name}.pdf"
+            render(text, out, footer=f"{title} · {a.today:%b %-d, %Y} · private",
+                   figures=charts.build(ledger, a.today))
+            (REPORTS / f"{name}.md").write_text(text)
+            print(f"wrote {out}")
         return 0
 
     if a.command == "snapshot":
